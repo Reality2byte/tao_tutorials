@@ -1,6 +1,6 @@
 numpy<=1.24.4
 opencv-python<=4.8.0.74
-pillow<=9.5.0
+pillow<=11.3.0
 matplotlib<=3.8.2
 scipy<=1.11.4
 h5py<=3.10.0
