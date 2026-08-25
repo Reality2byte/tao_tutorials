@@ -1,6 +1,7 @@
 """Gap analysis for DEFT pipelines.
 
 - :func:`analyze_clip_inference_gaps` — TAO CLIP PAS gap analysis.
+- :func:`summarize_pas_eval_metrics` — canonical mAP/Rank-1/Rank-5 for a PAS eval run.
 """
 
 def analyze_clip_inference_gaps(
@@ -59,7 +60,7 @@ def analyze_clip_inference_gaps(
 
     import pandas as pd
 
-    from pas_deft.pairs_io import iter_json_records, split_csv
+    from pas_deft.pairs_io import infer_dataset, iter_json_records, split_csv
 
     import glob
     import re
@@ -135,7 +136,7 @@ def analyze_clip_inference_gaps(
     ]
 
     def _truthy(value):
-        return str(value).strip().lower() in ("true", "1", "yes", "y")
+        return str(value).strip().lower() in ("true", "1", "yes", "y", "on")
 
     def _tokens(text):
         cleaned = (
@@ -208,30 +209,6 @@ def analyze_clip_inference_gaps(
                 return name
         return raw
 
-    def _infer_dataset(image_path):
-        normalized = str(image_path or "").replace("\\", "/")
-        parts = [p for p in normalized.split("/") if p]
-        for marker in ("images", "data"):
-            if marker in parts:
-                idx = parts.index(marker)
-                if idx + 1 < len(parts):
-                    return parts[idx + 1].strip()
-        return parts[0].strip() if parts else ""
-
-    def _metrics_path(base_dir):
-        candidates = [
-            os.path.join(base_dir, "nvidia_pas_metrics.csv"),
-            os.path.join(base_dir, "evaluate", "nvidia_pas_metrics.csv"),
-            os.path.join(base_dir, "pas_eval", "nvidia_pas_metrics.csv"),
-        ]
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
-        raise FileNotFoundError(
-            "Could not find nvidia_pas_metrics.csv under "
-            f"{base_dir}. Checked: {candidates}"
-        )
-
     def _query_text(query):
         for key in ("query_text", "caption", "text", "query"):
             value = str(query.get(key) or "").strip()
@@ -242,7 +219,7 @@ def analyze_clip_inference_gaps(
     def _query_metrics(query):
         matches = list(query.get("top_matches", []) or [])
         flags = [bool(m.get("is_correct")) for m in matches if isinstance(m, dict)]
-        correct = sum(1 for ok in flags if ok)
+        correct = sum(1 for ok in flags[:14] if ok)
         try:
             gt = int(query.get("num_ground_truth") or 0)
         except (TypeError, ValueError):
@@ -266,7 +243,9 @@ def analyze_clip_inference_gaps(
             return sums["First@14"] / n
         return sums["Rank-1"] / n
 
-    metrics_path = _metrics_path(results_dir)
+    metrics_path = os.path.join(results_dir, "nvidia_pas_metrics.csv")
+    if not os.path.isfile(metrics_path):
+        raise FileNotFoundError(f"Could not find nvidia_pas_metrics.csv at {metrics_path}")
     if not kpi_pairs_file:
         raise ValueError("PAS CLIP gap analysis requires kpi_pairs_file.")
     if not os.path.isfile(kpi_pairs_file):
@@ -296,11 +275,11 @@ def analyze_clip_inference_gaps(
                 n_queries = 0
             if n_queries < min_num_queries:
                 continue
-            if metric_name not in row or row.get(metric_name, "") == "":
+            if metric_name not in row or row.get(metric_name) in (None, ""):
                 continue
             try:
                 metric_value = float(row[metric_name])
-            except ValueError:
+            except (TypeError, ValueError):
                 continue
             metric_rows.append({
                 "dataset": dataset,
@@ -382,7 +361,7 @@ def analyze_clip_inference_gaps(
         caption = str(row.get("caption") or "").strip()
         unique_name = str(row.get("unique_name") or "").strip()
         image_path = str(row.get("image_path") or "")
-        dataset = str(row.get("dataset") or "").strip() or _infer_dataset(image_path)
+        dataset = str(row.get("dataset") or "").strip() or infer_dataset(image_path)
         if not caption or not unique_name or not dataset:
             skipped_pairs += 1
             continue
@@ -539,7 +518,11 @@ def analyze_clip_inference_gaps(
             elif isinstance(loaded_history, list):
                 history_entries = list(loaded_history)
                 history_payload["entries"] = history_entries
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"WARNING: could not read caption history file {caption_history_file} "
+                f"({exc}); treating caption-diversity history as empty for this run."
+            )
             history_entries = []
 
     history_counts = Counter()
@@ -966,8 +949,10 @@ def analyze_clip_inference_gaps(
                 "continual_dataset": continual_dataset_on,
                 "entries": existing_entries + new_entries,
             })
-            with open(caption_history_file, "w", encoding="utf-8") as f:
+            history_tmp_file = caption_history_file + ".tmp"
+            with open(history_tmp_file, "w", encoding="utf-8") as f:
                 json.dump(history_payload, f, indent=2, ensure_ascii=False)
+            os.replace(history_tmp_file, caption_history_file)
 
     preview_lines = ["PAS weak query sample preview", ""]
     for idx, row in gaps_df.head(100).iterrows():
@@ -1070,3 +1055,136 @@ def analyze_clip_inference_gaps(
     print(f"Saved weak PAS sample preview to {preview_path}")
     print(f"Saved weak query parquet to {gaps_parquet}")
     return gaps_parquet
+
+
+def summarize_pas_eval_metrics(
+    eval_dir: str,
+    query_types: str = "",
+    metric_names: str = "mAP,Rank-1,Rank-5",
+    aggregate: str = "weighted",
+) -> dict:
+    """Compute the single headline metrics for a PAS CLIP eval run.
+
+    The PAS eval writes three sibling CSVs per (Dataset, QueryType) round:
+    ``nvidia_pas_metrics.csv`` (one row per dataset/query-type, no rollups),
+    ``nvidia_pas_metrics_aggregate.csv`` (unweighted ``AVG_*`` rollup rows),
+    and ``nvidia_pas_metrics_weighted_aggregate.csv`` (``WAVG_*`` rollup
+    rows, each dataset weighted by its ``num_queries``). Different readers
+    can pick different files/rows/columns and land on different "the mAP
+    for this round" numbers. This function is the one place that decision
+    is made, so every caller (zero-shot summary, per-iteration summary,
+    ad-hoc analysis) reads the same number without re-deriving it from the
+    CSVs by hand.
+
+    Fixed convention:
+      * Source file / row selection: the weighted-aggregate CSV's
+        ``WAVG_*`` rows by default (each dataset weighted by its
+        ``num_queries``), not the unweighted-aggregate CSV's ``AVG_*`` rows
+        or a single dataset's row from the per-dataset CSV. Pass
+        ``aggregate="unweighted"`` to read ``AVG_*`` from the unweighted
+        aggregate CSV instead.
+      * Query types: ``image_to_image`` rows are always excluded (mirrors
+        gap analysis). If ``query_types`` is given, only those are kept;
+        otherwise every remaining query type is kept and combined into one
+        number, weighted by ``num_queries``.
+      * Metric columns: ``metric_names`` (default ``mAP``, ``Rank-1``,
+        ``Rank-5``). Each metric's value is a weighted average over only the
+        matched rows where that column is present and parseable; a metric
+        with no usable values across all matched rows raises ``ValueError``
+        rather than being silently reported as ``0.0``.
+
+    Args:
+        eval_dir:      Experiment/round root dir; its ``evaluate/`` subdir
+                       must directly contain nvidia_pas_metrics.csv and its
+                       ``_aggregate``/``_weighted_aggregate`` siblings.
+        query_types:   Optional comma-separated query-type filter.
+        metric_names:  Comma-separated metric columns to extract.
+        aggregate:     ``"weighted"`` (WAVG_* from the weighted-aggregate
+                       CSV) or ``"unweighted"`` (AVG_* from the aggregate
+                       CSV).
+
+    Returns:
+        Dict with the resolved metric values, the total ``num_queries``
+        behind them, and the source CSV path, e.g.::
+
+            {"source_csv": ..., "aggregate": "weighted",
+             "query_types": ["text_to_image"], "num_queries": 1234,
+             "mAP": 0.42, "Rank-1": 0.30, "Rank-5": 0.58}
+    """
+    import csv
+    import os
+
+    from pas_deft.pairs_io import split_csv
+
+    if aggregate not in ("weighted", "unweighted"):
+        raise ValueError(f"aggregate must be 'weighted' or 'unweighted', got {aggregate!r}")
+    if aggregate == "weighted":
+        prefix = "WAVG_"
+        agg_filename = "nvidia_pas_metrics_weighted_aggregate.csv"
+    else:
+        prefix = "AVG_"
+        agg_filename = "nvidia_pas_metrics_aggregate.csv"
+
+    metrics_path = os.path.join(eval_dir, "evaluate", agg_filename)
+    if not os.path.isfile(metrics_path):
+        raise FileNotFoundError(f"Could not find {agg_filename} at {metrics_path}")
+
+    qtype_filter = split_csv(query_types)
+    metric_cols = [m.strip() for m in str(metric_names or "").split(",") if m.strip()]
+    if not metric_cols:
+        raise ValueError(f"metric_names must name at least one metric column, got {metric_names!r}")
+
+    sums = {metric: 0.0 for metric in metric_cols}
+    metric_query_counts = {metric: 0 for metric in metric_cols}
+    total_queries = 0
+    matched_query_types = set()
+    with open(metrics_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            dataset = str(row.get("Dataset") or "").strip()
+            if not dataset.startswith(prefix):
+                continue
+            qtype = str(row.get("QueryType") or "").strip()
+            if qtype == "image_to_image":
+                continue
+            if qtype_filter and qtype not in qtype_filter:
+                continue
+            try:
+                n_queries = int(float(row.get("num_queries") or 0))
+            except ValueError:
+                n_queries = 0
+            if n_queries <= 0:
+                continue
+            for metric in metric_cols:
+                value = row.get(metric, "")
+                if value in ("", None):
+                    continue
+                try:
+                    sums[metric] += float(value) * n_queries
+                except ValueError:
+                    continue
+                else:
+                    metric_query_counts[metric] += n_queries
+            total_queries += n_queries
+            matched_query_types.add(qtype or "(blank)")
+
+    if total_queries == 0:
+        raise ValueError(
+            f"No {prefix}* rows matched query_types={query_types or 'all'!r} in {metrics_path}"
+        )
+
+    missing_metrics = [metric for metric in metric_cols if metric_query_counts[metric] == 0]
+    if missing_metrics:
+        raise ValueError(
+            f"No usable values for metric(s) {missing_metrics} among {prefix}* rows "
+            f"matched query_types={query_types or 'all'!r} in {metrics_path}"
+        )
+
+    result = {
+        "source_csv": metrics_path,
+        "aggregate": aggregate,
+        "query_types": sorted(matched_query_types),
+        "num_queries": total_queries,
+    }
+    for metric in metric_cols:
+        result[metric] = sums[metric] / metric_query_counts[metric]
+    return result

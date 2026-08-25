@@ -342,6 +342,9 @@ def _build_source_dict(raw: dict, mining_spec: dict) -> dict:
                 caption_expansion["count_expanded_pairs_toward_target"]
             ).lower()
         mining_out["caption_expansion"] = caption_expansion
+    for key in ("topn", "knn_metric"):
+        if not isinstance(mining_spec, dict) or key not in mining_spec:
+            raise ValueError(f"mining_spec.yaml is missing required key {key!r}")
     mining_out["topn"] = mining_spec["topn"]
     mining_out["knn_metric"] = mining_spec["knn_metric"]
 
@@ -458,6 +461,13 @@ class PasDeftConfig:
                 f"which the notebook mounts as "
                 f"-v $PWD/{os.path.basename(self.base_experiment_path)}:"
                 f"/{os.path.basename(self.base_experiment_path)}."
+            )
+        if self.base_experiment_path.split("/")[0] != "results":
+            raise ValueError(
+                f"experiment.results_path must be 'results' or start with 'results/', "
+                f"got {self.experiment.results_path!r}. The notebook always mounts its "
+                f"HOST_RESULTS_DIR (host ./results/) at the container path /results, "
+                f"so any other top-level name is unreachable inside the container."
             )
         if self.iteration.end < self.iteration.start:
             raise ValueError(
